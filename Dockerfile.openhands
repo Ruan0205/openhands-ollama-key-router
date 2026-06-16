@@ -1,0 +1,39 @@
+FROM docker.openhands.dev/openhands/openhands:1.8
+
+USER root
+RUN python - <<'PY'
+from pathlib import Path
+
+path = Path("/app/openhands/app_server/sandbox/docker_sandbox_service.py")
+text = path.read_text()
+old = """        env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
+            f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'
+        )
+"""
+new = """        env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
+            f'{self.web_url}/api/v1/webhooks'
+            if self.web_url
+            else f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'
+        )
+"""
+if old not in text:
+    raise SystemExit("Expected webhook block was not found")
+text = text.replace(old, new)
+
+old_timeout = """            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+"""
+new_timeout = """            except asyncio.CancelledError:
+                raise
+            except httpx.ReadTimeout as exc:
+                _logger.info(
+                    f'Sandbox server busy during health check: {app_server_url} : {exc}'
+                )
+                return sandbox_info
+            except Exception as exc:
+"""
+if old_timeout not in text:
+    raise SystemExit("Expected health-check exception block was not found")
+path.write_text(text.replace(old_timeout, new_timeout))
+PY

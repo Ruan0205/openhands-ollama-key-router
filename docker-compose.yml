@@ -1,0 +1,163 @@
+name: openhands-ollama-agent
+
+services:
+  manager:
+    profiles:
+      - external-ollama
+      - bundled-ollama
+    build:
+      context: ./manager-app
+      dockerfile: Dockerfile
+    image: ${MANAGER_IMAGE:-ollama-agent-manager:latest}
+    container_name: ${MANAGER_CONTAINER_NAME:-ollama-manager}
+    restart: unless-stopped
+    ports:
+      - "${MANAGER_PORT:-3005}:8080"
+    environment:
+      MANAGER_USERNAME: ${MANAGER_USERNAME:-admin}
+      MANAGER_PASSWORD: ${MANAGER_PASSWORD:-change-me}
+      PROXY_API_KEY: ${PROXY_API_KEY:-ollama}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      OLLAMA_API_KEYS: ${OLLAMA_API_KEYS:-}
+      API_KEYS_FILE: /data/api-keys.json
+      UPSTREAM_MODE: ${UPSTREAM_MODE:-external_ollama}
+      API_KEY_AUTO_FALLBACK: ${API_KEY_AUTO_FALLBACK:-true}
+      DEFAULT_QUOTA_RESET_HOURS: ${DEFAULT_QUOTA_RESET_HOURS:-0}
+      SWITCH_THRESHOLD_PERCENT: ${SWITCH_THRESHOLD_PERCENT:-10}
+      HANDOFF_DIR: /data/handoffs
+      EVENT_LOG_FILE: /data/events.jsonl
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      DIRECT_CLOUD_BASE_URL: ${DIRECT_CLOUD_BASE_URL:-https://ollama.com}
+      OPENHANDS_API_URL: ${OPENHANDS_API_URL:-http://openhands:3000}
+      OPENHANDS_PUBLIC_URL: ${OPENHANDS_PUBLIC_URL}
+      OPENWEBUI_PUBLIC_URL: ${OPENWEBUI_PUBLIC_URL}
+      SEARXNG_URL: http://searxng:8080
+      DEFAULT_MODEL: ${DEFAULT_MODELS}
+      OPENHANDS_LLM_BASE_URL: ${OPENHANDS_LLM_BASE_URL:-http://ollama-manager:8080/llm/v1}
+      OPENHANDS_STREAM: ${OPENHANDS_STREAM:-false}
+    volumes:
+      - manager-data:/data
+    networks:
+      - openhands
+
+  openhands:
+    profiles:
+      - external-ollama
+      - bundled-ollama
+    build:
+      context: .
+      dockerfile: Dockerfile.openhands
+    image: ${OPENHANDS_IMAGE:-openhands-app-fixed:1.8}
+    container_name: ${OPENHANDS_CONTAINER_NAME:-openhands-app}
+    restart: unless-stopped
+    depends_on:
+      - manager
+    environment:
+      AGENT_SERVER_IMAGE_REPOSITORY: ${AGENT_SERVER_IMAGE_REPOSITORY:-openhands-agent-server-fixed}
+      AGENT_SERVER_IMAGE_TAG: ${AGENT_SERVER_IMAGE_TAG:-1.26.0}
+      LOG_ALL_EVENTS: ${LOG_ALL_EVENTS:-true}
+      SANDBOX_USER_ID: ${SANDBOX_USER_ID:-1000}
+      SANDBOX_VOLUMES: ${SANDBOX_VOLUMES}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      LLM_DISABLE_VISION: ${LLM_DISABLE_VISION:-true}
+      SANDBOX_CONTAINER_URL_PATTERN: ${SANDBOX_CONTAINER_URL_PATTERN}
+      OH_ALLOW_CORS_ORIGINS_0: ${OPENHANDS_PUBLIC_URL}
+      OH_ALLOW_CORS_ORIGINS_1: ${OPENHANDS_PUBLIC_URL}
+      OH_PERMITTED_CORS_ORIGINS_0: ${OPENHANDS_PUBLIC_URL}
+      OH_WEB_URL: ${OPENHANDS_INTERNAL_WEB_URL:-http://host.docker.internal:3003}
+      OH_WEBHOOKS_0_BASE_URL: ${OPENHANDS_INTERNAL_WEB_URL:-http://host.docker.internal:3003}/api/v1/webhooks
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${OPENHANDS_DATA_DIR:-./runtime/openhands}:/.openhands
+    expose:
+      - "3000"
+    ports:
+      - "${OPENHANDS_INTERNAL_BIND:-127.0.0.1}:${OPENHANDS_INTERNAL_PORT:-3003}:3000"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - openhands
+
+  proxy:
+    profiles:
+      - external-ollama
+      - bundled-ollama
+    image: nginx:1.27-alpine
+    container_name: ${OPENHANDS_PROXY_CONTAINER_NAME:-openhands-proxy}
+    restart: unless-stopped
+    depends_on:
+      - openhands
+    ports:
+      - "${OPENHANDS_PROXY_PORT:-3002}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${OPENHANDS_HTPASSWD_FILE:-./runtime/htpasswd}:/etc/nginx/htpasswd:ro
+    networks:
+      - openhands
+
+  searxng:
+    profiles:
+      - external-ollama
+      - bundled-ollama
+    image: searxng/searxng:latest
+    container_name: ${SEARXNG_CONTAINER_NAME:-openhands-search}
+    restart: unless-stopped
+    ports:
+      - "${SEARXNG_PORT:-8083}:8080"
+    volumes:
+      - ./searxng-settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - openhands
+
+  open-webui:
+    profiles:
+      - external-ollama
+      - bundled-ollama
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ${OPEN_WEBUI_CONTAINER_NAME:-open-webui}
+    restart: unless-stopped
+    depends_on:
+      - manager
+      - searxng
+    ports:
+      - "${OPEN_WEBUI_PORT:-3004}:8080"
+    environment:
+      WEBUI_NAME: ${WEBUI_NAME:-Ollama Agent WebUI}
+      WEBUI_AUTH: ${WEBUI_AUTH:-False}
+      ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API:-True}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      ENABLE_OPENAI_API: ${ENABLE_OPENAI_API:-True}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-ollama}
+      DEFAULT_MODELS: ${DEFAULT_MODELS}
+      ENABLE_RAG_WEB_SEARCH: ${ENABLE_RAG_WEB_SEARCH:-True}
+      RAG_WEB_SEARCH_ENGINE: ${RAG_WEB_SEARCH_ENGINE:-searxng}
+      SEARXNG_QUERY_URL: http://searxng:8080/search?q=<query>
+    volumes:
+      - open-webui-data:/app/backend/data
+    networks:
+      - openhands
+
+  ollama:
+    profiles:
+      - bundled-ollama
+    image: ollama/ollama:latest
+    container_name: ${OLLAMA_CONTAINER_NAME:-ollama}
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - openhands
+
+networks:
+  openhands:
+    name: ${OPENHANDS_NETWORK:-openhands}
+
+volumes:
+  manager-data:
+  open-webui-data:
+  ollama-data:

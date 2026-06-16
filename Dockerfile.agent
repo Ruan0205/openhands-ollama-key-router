@@ -1,0 +1,11 @@
+FROM ghcr.io/openhands/agent-server:1.26.0-python
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod 0711 /root \
+    && rm -rf /root/.ssh \
+    && ln -s /home/openhands/.ssh /root/.ssh
+
+USER openhands

@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+!.env.external-ollama.example
+!.env.direct-cloud.example
+!.env.bundled-ollama.example
+
+runtime/
+data/
+*.log
+__pycache__/
+*.pyc
+
+# Local/private helper files from earlier experiments; do not publish.
+*.ps1
+qwen3.6-mtp-load-config.json
+corrected-PLAN.md
+*-SKILL.md
+
+# Generated manager state.
+manager-app/.tmp-*
+manager-app/__pycache__/
