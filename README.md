@@ -210,17 +210,41 @@ from responses and combines it with the quota you configure manually:
    routed to the enabled key with the highest estimated remaining token count.
 5. After a completed response, if the current key reaches `SWITCH_THRESHOLD_PERCENT`
    or lower, the manager changes the active key to the next best account.
-6. If a key returns `401`, `403`, or `429` before a response is returned, the
-   manager retries the next available key.
+6. If a key returns provider errors such as `401`, `403`, `404`, `408`, `429`,
+   or `5xx`, or if the upstream stops responding before a response is returned,
+   the manager marks that key as temporarily blocked and retries the next
+   available key with the same request body.
 7. Non-streaming responses are counted using `usage.total_tokens` or Ollama
    native `prompt_eval_count + eval_count` metrics when present. Streaming
    responses are counted only when the upstream includes usage data in the
    stream.
+8. If the whole key loop fails, the manager enters wait mode. In wait mode,
+   `/llm/v1` returns `503` instead of burning retries forever. Use the manager UI
+   to adjust keys/quotas/model and click `Aplicar no OpenHands`, `Salvar
+   roteamento`, or `Sair do aguarde` to restart attempts.
 
 OpenHands is kept on `stream=false` in the tested setup so the manager can count
 usage reliably and fail over with minimal interruption. A request that is
 already mid-generation cannot be moved to another account without restarting
 that individual request.
+
+## Manual Account Control
+
+The manager UI includes:
+
+- `Proxima conta agora`: immediately switches to the next enabled, non-blocked
+  API key and writes a handoff file;
+- `Sair do aguarde`: clears wait mode and temporary runtime key blocks;
+- `Aplicar no OpenHands`: applies the selected Cloud/API-key model and clears
+  wait mode;
+- `Aplicar modelo local/externo`: the only button allowed to intentionally apply
+  a local or external Ollama model. Normal Cloud operation does not fall back to
+  local models automatically.
+
+When `UPSTREAM_MODE=direct_cloud`, the model dropdown is populated from
+`https://ollama.com/v1/models` using the active API key. Local Windows Ollama
+models are not shown in that mode, which prevents accidental fallback to a local
+model.
 
 ## Context Handoff
 

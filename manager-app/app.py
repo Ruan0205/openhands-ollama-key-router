@@ -155,6 +155,9 @@ def normalize_key_item(item, existing=None):
         "last_test_error": str(item.get("last_test_error", existing.get("last_test_error", "")))[:1000],
         "last_test_model_count": to_int(item.get("last_test_model_count", existing.get("last_test_model_count", 0))),
         "last_status": str(item.get("last_status", existing.get("last_status", "")))[:120],
+        "runtime_blocked": bool(item.get("runtime_blocked", existing.get("runtime_blocked", False))),
+        "runtime_blocked_reason": str(item.get("runtime_blocked_reason", existing.get("runtime_blocked_reason", "")))[:240],
+        "runtime_blocked_at": normalize_reset_at(item.get("runtime_blocked_at", existing.get("runtime_blocked_at"))),
     }
 
 
@@ -181,12 +184,16 @@ def normalize_store(store):
     mode = store.get("upstream_mode", "external_ollama")
     if mode not in ("external_ollama", "direct_cloud"):
         mode = "external_ollama"
+    threshold = to_float(store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT), SWITCH_THRESHOLD_PERCENT)
+    if threshold <= 0:
+        threshold = SWITCH_THRESHOLD_PERCENT
     return {
         "upstream_mode": mode,
         "active_key": active_key,
         "auto_fallback": bool(store.get("auto_fallback", False)),
-        "switch_threshold_percent": to_float(store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT), SWITCH_THRESHOLD_PERCENT),
+        "switch_threshold_percent": threshold,
         "last_switch": store.get("last_switch") or {},
+        "wait_mode": store.get("wait_mode") or {"enabled": False},
         "keys": keys,
     }
 
@@ -317,6 +324,9 @@ def public_key_item(item, threshold_percent=None):
         "last_test_error": item.get("last_test_error") or "",
         "last_test_model_count": to_int(item.get("last_test_model_count"), 0),
         "last_status": item.get("last_status") or "",
+        "runtime_blocked": bool(item.get("runtime_blocked", False)),
+        "runtime_blocked_reason": item.get("runtime_blocked_reason") or "",
+        "runtime_blocked_at": normalize_reset_at(item.get("runtime_blocked_at")),
     }
 
 
@@ -331,6 +341,7 @@ def public_key_store():
         "auto_fallback": bool(store.get("auto_fallback", False)),
         "switch_threshold_percent": threshold,
         "last_switch": store.get("last_switch") or {},
+        "wait_mode": store.get("wait_mode") or {"enabled": False},
         "keys": keys,
         "totals": {
             "total_known_quota_tokens": sum(item["quota_limit_tokens"] for item in known_quota),
@@ -380,7 +391,7 @@ def ordered_keys_by_quota(keys, active_key=None, threshold_percent=None):
 
 def active_api_keys():
     store = load_key_store()
-    keys = [k for k in store.get("keys", []) if k.get("enabled", True)]
+    keys = [k for k in store.get("keys", []) if k.get("enabled", True) and not k.get("runtime_blocked")]
     active = store.get("active_key")
     threshold = store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT)
     if store.get("auto_fallback", False):
@@ -453,6 +464,31 @@ def update_key_test_status(name, ok, error="", model_count=0):
             item["last_status"] = "test ok" if ok else "test failed"
             save_key_store(store)
             break
+
+
+def mark_key_blocked(name, reason):
+    store = load_key_store()
+    for item in store.get("keys", []):
+        if item.get("name") == name:
+            item["runtime_blocked"] = True
+            item["runtime_blocked_reason"] = str(reason)[:240]
+            item["runtime_blocked_at"] = now_ts()
+            item["last_status"] = f"blocked: {str(reason)[:90]}"
+            save_key_store(store)
+            return public_key_store()
+    return public_key_store()
+
+
+def clear_runtime_blocks(store=None):
+    own_store = store is None
+    store = store or load_key_store()
+    for item in store.get("keys", []):
+        item["runtime_blocked"] = False
+        item["runtime_blocked_reason"] = ""
+        item["runtime_blocked_at"] = None
+    if own_store:
+        save_key_store(store)
+    return store
 
 
 def reset_usage(name=None):
@@ -572,7 +608,10 @@ def key_snapshot(name, store=None):
 
 
 def next_key_name(store, previous_name=None):
-    keys = [k for k in store.get("keys", []) if k.get("enabled", True) and k.get("name") != previous_name]
+    keys = [
+        k for k in store.get("keys", [])
+        if k.get("enabled", True) and not k.get("runtime_blocked") and k.get("name") != previous_name
+    ]
     ordered = ordered_keys_by_quota(keys, store.get("active_key"), store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT))
     return ordered[0].get("name") if ordered else None
 
@@ -590,8 +629,54 @@ def set_active_key(name, reason, previous_key=None, handoff_path=None):
         "at": now_ts(),
         "handoff_path": handoff_path,
     }
+    store["wait_mode"] = {"enabled": False}
     save_key_store(store)
     return public_key_store()
+
+
+def clear_wait_mode(reason="user_action"):
+    store = load_key_store()
+    clear_runtime_blocks(store)
+    store["wait_mode"] = {"enabled": False, "cleared_at": now_ts(), "reason": reason}
+    save_key_store(store)
+    return public_key_store()
+
+
+def enter_wait_mode(reason, errors=None, request_body=None, previous_key=None):
+    store = load_key_store()
+    handoff_path, _ = write_handoff(
+        reason,
+        previous_key,
+        None,
+        request_body=request_body,
+        error=json.dumps(errors or [], ensure_ascii=False, indent=2),
+    )
+    store["wait_mode"] = {
+        "enabled": True,
+        "reason": reason,
+        "at": now_ts(),
+        "errors": errors or [],
+        "handoff_path": handoff_path,
+    }
+    store["last_switch"] = {
+        "from": previous_key,
+        "to": None,
+        "reason": reason,
+        "at": now_ts(),
+        "handoff_path": handoff_path,
+    }
+    save_key_store(store)
+    return public_key_store()
+
+
+def switch_to_next_key(reason="manual_next", request_body=None):
+    store = load_key_store()
+    current = store.get("active_key")
+    nxt = next_key_name(store, previous_name=current)
+    if not nxt:
+        return enter_wait_mode("manual_next_no_available_key", request_body=request_body, previous_key=current)
+    handoff_path, _ = write_handoff(reason, current, nxt, request_body=request_body)
+    return set_active_key(nxt, reason, previous_key=current, handoff_path=handoff_path)
 
 
 def write_handoff(reason, previous_key, next_key, request_body=None, response_body=None, tokens=0, error=None):
@@ -773,33 +858,33 @@ def collect_status():
     except Exception as exc:
         out["checks"]["ollama_account"] = str(exc)
 
-    try:
-        tags = http_json("GET", f"{OLLAMA_BASE_URL}/api/tags")
-        models = [classify_model(item) for item in tags.get("models", [])]
-        out["models"] = models
-        out["cloud_models"] = [m for m in models if m["kind"] == "cloud"]
-        out["local_models"] = [m for m in models if m["kind"] == "local"]
-        out["checks"]["ollama_models"] = "ok"
-    except Exception as exc:
-        out["checks"]["ollama_models"] = str(exc)
-        if direct_mode:
-            try:
-                models = list_direct_cloud_models()
-                out["models"] = models
-                out["cloud_models"] = models
-                out["local_models"] = []
-                out["checks"]["direct_cloud_models"] = "ok"
-            except Exception as direct_exc:
-                out["ok"] = False
-                out["models"] = []
-                out["cloud_models"] = []
-                out["local_models"] = []
-                out["checks"]["direct_cloud_models"] = str(direct_exc)
-        else:
+    if direct_mode:
+        try:
+            models = list_direct_cloud_models()
+            out["models"] = models
+            out["cloud_models"] = models
+            out["local_models"] = []
+            out["checks"]["direct_cloud_models"] = "ok"
+        except Exception as direct_exc:
             out["ok"] = False
             out["models"] = []
             out["cloud_models"] = []
             out["local_models"] = []
+            out["checks"]["direct_cloud_models"] = str(direct_exc)
+    else:
+        try:
+            tags = http_json("GET", f"{OLLAMA_BASE_URL}/api/tags")
+            models = [classify_model(item) for item in tags.get("models", [])]
+            out["models"] = models
+            out["cloud_models"] = [m for m in models if m["kind"] == "cloud"]
+            out["local_models"] = [m for m in models if m["kind"] == "local"]
+            out["checks"]["ollama_models"] = "ok"
+        except Exception as exc:
+            out["ok"] = False
+            out["models"] = []
+            out["cloud_models"] = []
+            out["local_models"] = []
+            out["checks"]["ollama_models"] = str(exc)
 
     try:
         settings = http_json("GET", f"{OPENHANDS_API_URL}/api/v1/settings")
@@ -898,7 +983,10 @@ def test_stream(model, upstream_mode=None, key_name=None):
     return {"ok": False, "model": model, "upstream_mode": mode, "errors": errors}
 
 
-def apply_openhands(model, base_url=None, stream=None):
+def apply_openhands(model, base_url=None, stream=None, allow_local_model=False):
+    store = load_key_store()
+    if store.get("upstream_mode") != "direct_cloud" and not allow_local_model:
+        raise ValueError("Modo local/externo só pode ser aplicado pelo botão explícito de modelo local.")
     llm_model = model if model.startswith("openai/") else f"openai/{model}"
     use_stream = OPENHANDS_STREAM if stream is None else bool(stream)
     payload = {
@@ -917,7 +1005,9 @@ def apply_openhands(model, base_url=None, stream=None):
             }
         }
     }
-    return http_json("POST", f"{OPENHANDS_API_URL}/api/v1/settings", payload)
+    result = http_json("POST", f"{OPENHANDS_API_URL}/api/v1/settings", payload)
+    clear_wait_mode("apply_openhands")
+    return result
 
 
 def upsert_api_key(name, value, enabled=True, quota_limit_tokens=None, reset_period_hours=None, reset_at=None, used_tokens=None):
@@ -977,6 +1067,8 @@ def update_routing(mode=None, active_key=None, auto_fallback=None, switch_thresh
         store["auto_fallback"] = bool(auto_fallback)
     if switch_threshold_percent is not None:
         store["switch_threshold_percent"] = to_float(switch_threshold_percent, SWITCH_THRESHOLD_PERCENT)
+    clear_runtime_blocks(store)
+    store["wait_mode"] = {"enabled": False, "cleared_at": now_ts(), "reason": "routing_update"}
     save_key_store(store)
     return public_key_store()
 
@@ -1071,6 +1163,7 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="loadStatus()">Atualizar status</button>
         <button onclick="testStream()">Testar streaming</button>
         <button onclick="applyOpenHands()">Aplicar no OpenHands</button>
+        <button onclick="applyLocalOpenHands()">Aplicar modelo local/externo</button>
         <a href="https://ollama.com/signin" target="_blank">Abrir login oficial Ollama no Chrome</a>
       </div>
     </section>
@@ -1098,6 +1191,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="stat"><span class="muted">Tokens usados rastreados</span><strong id="totalUsed">-</strong></div>
         <div class="stat"><span class="muted">Contas com quota</span><strong id="knownAccounts">-</strong></div>
         <div class="stat"><span class="muted">Contas sem quota</span><strong id="unknownAccounts">-</strong></div>
+        <div class="stat"><span class="muted">Estado do roteador</span><strong id="waitMode">-</strong></div>
       </div>
       <div class="row">
         <label>Modo
@@ -1114,6 +1208,8 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="saveRouting()">Salvar roteamento</button>
         <button onclick="testActiveKey()">Testar chave ativa</button>
         <button onclick="testAllKeys()">Testar todas</button>
+        <button onclick="nextKeyNow()">Próxima conta agora</button>
+        <button onclick="clearWaitMode()">Sair do aguarde</button>
         <button onclick="resetSelectedUsage()">Resetar uso da ativa</button>
         <button onclick="resetAllUsage()">Resetar uso de todas</button>
         <button onclick="loadHandoff()">Ver handoff</button>
@@ -1235,6 +1331,8 @@ function renderKeys(store) {
   document.getElementById('totalUsed').textContent = fmtNumber(totals.total_used_tokens || 0);
   document.getElementById('knownAccounts').textContent = fmtNumber(totals.known_quota_accounts || 0);
   document.getElementById('unknownAccounts').textContent = fmtNumber(totals.unknown_quota_accounts || 0);
+  const wait = store.wait_mode || {};
+  document.getElementById('waitMode').textContent = wait.enabled ? `aguardando (${wait.reason || 'sem motivo'})` : 'ativo';
   const select = document.getElementById('activeKey');
   select.innerHTML = '<option value="">nenhuma</option>';
   for (const key of store.keys || []) {
@@ -1249,9 +1347,10 @@ function renderKeys(store) {
     const remainingClass = key.remaining_tokens === 0 ? 'danger' : '';
     const test = key.last_test_at ? `${key.last_test_ok ? 'OK' : 'falhou'} em ${fmtTime(key.last_test_at)}` : 'não testada';
     const err = key.last_test_error ? `<div class="danger mini">${escapeHtml(key.last_test_error)}</div>` : '';
+    const blocked = key.runtime_blocked ? `<div class="danger mini">bloqueada: ${escapeHtml(key.runtime_blocked_reason || '')}</div>` : '';
     return `<tr>
       <td><strong>${escapeHtml(key.name)}</strong><br><span class="muted mini">${escapeHtml(key.masked || '')}</span></td>
-      <td><span class="pill">${key.enabled ? 'ativa' : 'desativada'}</span> <span class="pill">${escapeHtml(key.quota_status || 'unknown')}</span><br><span class="muted mini">${escapeHtml(key.last_status || '')}</span></td>
+      <td><span class="pill">${key.enabled ? 'ativa' : 'desativada'}</span> <span class="pill">${escapeHtml(key.quota_status || 'unknown')}</span>${blocked}<br><span class="muted mini">${escapeHtml(key.last_status || '')}</span></td>
       <td><span class="${remainingClass}">${fmtNumber(key.remaining_tokens)} restantes</span><br><span class="muted mini">${key.remaining_percent ?? '??'}% sobrando; ${fmtNumber(key.used_tokens || 0)} usados / ${key.quota_limit_tokens ? fmtNumber(key.quota_limit_tokens) : 'limite desconhecido'}</span></td>
       <td>${fmtDuration(key.seconds_to_reset)}<br><span class="muted mini">${fmtTime(key.reset_at)}</span></td>
       <td>${test}${err}<br><span class="muted mini">${fmtNumber(key.last_test_model_count || 0)} modelos listados</span></td>
@@ -1393,6 +1492,28 @@ async function testAllKeys() {
   }
 }
 
+async function nextKeyNow() {
+  document.getElementById('result').textContent = 'Trocando para a próxima conta...';
+  try {
+    const data = await api('/api/next-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    renderKeys(data);
+    document.getElementById('result').textContent = pretty(data);
+  } catch (err) {
+    document.getElementById('result').textContent = String(err);
+  }
+}
+
+async function clearWaitMode() {
+  document.getElementById('result').textContent = 'Saindo do modo aguarde...';
+  try {
+    const data = await api('/api/clear-wait', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    renderKeys(data);
+    document.getElementById('result').textContent = pretty(data);
+  } catch (err) {
+    document.getElementById('result').textContent = String(err);
+  }
+}
+
 async function resetSelectedUsage() {
   const name = document.getElementById('activeKey').value;
   if (!name) {
@@ -1442,7 +1563,24 @@ async function applyOpenHands() {
     const data = await api('/api/apply-openhands', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, stream })
+      body: JSON.stringify({ model, stream, allow_local_model: false })
+    });
+    document.getElementById('result').textContent = pretty(data);
+    await loadStatus();
+  } catch (err) {
+    document.getElementById('result').textContent = String(err);
+  }
+}
+
+async function applyLocalOpenHands() {
+  const model = document.getElementById('model').value;
+  const stream = document.getElementById('stream').checked;
+  document.getElementById('result').textContent = `Aplicando modelo local/externo explicitamente: ${model}...`;
+  try {
+    const data = await api('/api/apply-openhands', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, stream, allow_local_model: true })
     });
     document.getElementById('result').textContent = pretty(data);
     await loadStatus();
@@ -1505,13 +1643,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         store = load_key_store()
         mode = store.get("upstream_mode", "external_ollama")
+        if mode == "direct_cloud" and (store.get("wait_mode") or {}).get("enabled"):
+            self.send_json(503, {
+                "error": "Todas as contas falharam ou parecem sem tokens. Manager em modo aguardando.",
+                "wait_mode": store.get("wait_mode"),
+                "action": "Ajuste as quotas/chaves ou aplique novamente um modelo no Manager para reiniciar as tentativas.",
+            })
+            return
         parsed = urllib.parse.urlsplit(self.path)
         suffix = parsed.path[len(prefix):]
         target_base = DIRECT_CLOUD_BASE_URL if mode == "direct_cloud" else OLLAMA_BASE_URL
         if mode == "direct_cloud":
             keys = active_api_keys()
             if not keys:
-                self.send_json(502, {"error": "Modo direct_cloud selecionado, mas nenhuma API key ativa foi configurada."})
+                state = enter_wait_mode("no_active_api_keys", request_body=None)
+                self.send_json(503, {"error": "Modo direct_cloud selecionado, mas nenhuma API key ativa foi configurada.", "key_store": state})
                 return
         else:
             keys = [{"name": "external-ollama", "value": LLM_API_KEY}]
@@ -1527,6 +1673,8 @@ class Handler(BaseHTTPRequestHandler):
         if mode == "direct_cloud":
             body = prepare_direct_cloud_body(body, headers.get("Content-Type", ""))
         last_error = None
+        errors = []
+        retryable_statuses = {401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504}
         for idx, api_key in enumerate(keys):
             upstream_headers = dict(headers)
             if mode == "direct_cloud":
@@ -1535,6 +1683,8 @@ class Handler(BaseHTTPRequestHandler):
                 upstream_headers["Authorization"] = f"Bearer {LLM_API_KEY}"
             req = urllib.request.Request(target, data=body, headers=upstream_headers, method=self.command)
             try:
+                response_body = b""
+                sample = bytearray()
                 with urllib.request.urlopen(req, timeout=600) as resp:
                     content_type = resp.headers.get("Content-Type", "application/octet-stream")
                     if "text/event-stream" in content_type:
@@ -1544,7 +1694,6 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_header("X-Manager-Upstream-Mode", mode)
                         self.send_header("X-Manager-Key-Name", str(api_key.get("name", "")))
                         self.end_headers()
-                        sample = bytearray()
                         while True:
                             chunk = resp.read(8192)
                             if not chunk:
@@ -1574,8 +1723,23 @@ class Handler(BaseHTTPRequestHandler):
             except urllib.error.HTTPError as exc:
                 body_text = exc.read()
                 last_error = (exc.code, exc.headers, body_text, api_key.get("name"))
-                if mode == "direct_cloud" and store.get("auto_fallback", False) and exc.code in (401, 403, 429) and idx < len(keys) - 1:
-                    next_name = keys[idx + 1].get("name")
+                error_item = {
+                    "key": api_key.get("name"),
+                    "status": exc.code,
+                    "error": body_text.decode("utf-8", "replace")[:1000],
+                }
+                errors.append(error_item)
+                if mode == "direct_cloud" and store.get("auto_fallback", False) and exc.code in retryable_statuses:
+                    mark_key_blocked(api_key.get("name"), f"http_{exc.code}")
+                    next_name = keys[idx + 1].get("name") if idx < len(keys) - 1 else None
+                    if not next_name:
+                        state = enter_wait_mode(f"all_keys_failed_http_{exc.code}", errors=errors, request_body=body, previous_key=api_key.get("name"))
+                        self.send_json(503, {
+                            "error": "Todas as contas foram testadas e falharam. Manager em modo aguardando.",
+                            "last_status": exc.code,
+                            "key_store": state,
+                        })
+                        return
                     handoff_path, _ = write_handoff(
                         f"upstream_http_{exc.code}_fallback",
                         api_key.get("name"),
@@ -1594,9 +1758,39 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body_text)
                 return
             except Exception as exc:
+                error_item = {"key": api_key.get("name"), "error": str(exc)}
+                errors.append(error_item)
+                if mode == "direct_cloud" and store.get("auto_fallback", False):
+                    mark_key_blocked(api_key.get("name"), "upstream_exception")
+                    next_name = keys[idx + 1].get("name") if idx < len(keys) - 1 else None
+                    if next_name:
+                        handoff_path, _ = write_handoff(
+                            "upstream_exception_fallback",
+                            api_key.get("name"),
+                            next_name,
+                            request_body=body,
+                            error=str(exc),
+                        )
+                        set_active_key(next_name, "upstream_exception_fallback", previous_key=api_key.get("name"), handoff_path=handoff_path)
+                        continue
+                    state = enter_wait_mode("all_keys_failed_exception", errors=errors, request_body=body, previous_key=api_key.get("name"))
+                    self.send_json(503, {
+                        "error": "Todas as contas foram testadas e falharam. Manager em modo aguardando.",
+                        "key_store": state,
+                    })
+                    return
                 self.send_json(502, {"error": str(exc), "target": target, "upstream_mode": mode})
                 return
         if last_error:
+            if mode == "direct_cloud":
+                code, headers_obj, body_text, key_name = last_error
+                state = enter_wait_mode(f"all_keys_failed_http_{code}", errors=errors, request_body=body, previous_key=key_name)
+                self.send_json(503, {
+                    "error": "Todas as contas foram testadas e falharam. Manager em modo aguardando.",
+                    "last_status": code,
+                    "key_store": state,
+                })
+                return
             code, headers_obj, body_text, key_name = last_error
             self.send_response(code)
             self.send_header("Content-Type", headers_obj.get("Content-Type", "application/json"))
@@ -1662,7 +1856,12 @@ class Handler(BaseHTTPRequestHandler):
                 model = payload.get("model") or DEFAULT_MODEL
                 base_url = payload.get("base_url") or OPENHANDS_LLM_BASE_URL
                 stream = payload.get("stream")
-                self.send_json(200, apply_openhands(model, base_url=base_url, stream=stream))
+                self.send_json(200, apply_openhands(
+                    model,
+                    base_url=base_url,
+                    stream=stream,
+                    allow_local_model=payload.get("allow_local_model", False),
+                ))
                 return
             if self.path == "/api/api-keys":
                 self.send_json(200, upsert_api_key(
@@ -1694,6 +1893,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/reset-usage":
                 self.send_json(200, reset_usage(payload.get("name")))
+                return
+            if self.path == "/api/next-key":
+                self.send_json(200, switch_to_next_key("manual_next"))
+                return
+            if self.path == "/api/clear-wait":
+                self.send_json(200, clear_wait_mode("manual_clear_wait"))
                 return
             self.send_json(404, {"error": "not found"})
         except urllib.error.HTTPError as exc:
