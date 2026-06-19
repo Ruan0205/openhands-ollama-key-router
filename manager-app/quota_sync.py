@@ -37,6 +37,10 @@ def to_int(value, default=0):
         return default
 
 
+def quota_used(item):
+    return to_int(item.get("effective_used_tokens", item.get("used_tokens")), 0)
+
+
 def load_store():
     if not STORE_FILE.exists():
         return None
@@ -230,6 +234,8 @@ def probe_account(api_key):
 
 def clear_key_block(item, now, reason):
     item["used_tokens"] = 0
+    item["effective_used_tokens"] = 0
+    item["model_usage"] = {}
     item["runtime_blocked"] = False
     item["runtime_blocked_reason"] = ""
     item["runtime_blocked_at"] = None
@@ -256,7 +262,7 @@ def synchronize():
             continue
 
         previous_period = float(item.get("reset_period_hours") or 0)
-        used = to_int(item.get("used_tokens"), 0)
+        used = quota_used(item)
         blocked = bool(item.get("runtime_blocked"))
         enabled = bool(item.get("enabled", True))
 
@@ -339,7 +345,7 @@ def synchronize():
         if isinstance(item, dict)
         and item.get("enabled", True)
         and not item.get("runtime_blocked")
-        and to_int(item.get("used_tokens"), 0)
+        and quota_used(item)
         < to_int(item.get("quota_limit_tokens"), QUOTA_LIMIT)
     ]
 
@@ -353,7 +359,7 @@ def synchronize():
         if (
             not active_item
             or active_item.get("runtime_blocked")
-            or to_int(active_item.get("used_tokens"), 0) >= QUOTA_LIMIT
+            or quota_used(active_item) >= QUOTA_LIMIT
         ):
             store["active_key"] = available[0].get("name")
             changed = True

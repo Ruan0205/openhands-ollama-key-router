@@ -556,6 +556,7 @@ function renderLiveQuota(store) {{
   const setText = (id, value) => {{ const el = document.getElementById(id); if (el) el.textContent = value; }};
   setText('totalRemaining', fmtNumber(totals.total_remaining_tokens));
   setText('totalUsed', fmtNumber(totals.total_used_tokens || 0));
+  setText('totalRaw', fmtNumber(totals.total_raw_tokens || 0));
   setText('knownAccounts', fmtNumber(totals.known_quota_accounts || 0));
   setText('unknownAccounts', fmtNumber(totals.unknown_quota_accounts || 0));
   const wait = store.wait_mode || {{}};
@@ -567,10 +568,14 @@ function renderLiveQuota(store) {{
     const test = key.last_test_at ? `${{key.last_test_ok ? 'OK' : 'falhou'}} em ${{fmtTime(key.last_test_at)}}` : 'não testada';
     const err = key.last_test_error ? `<div class="danger mini">${{escapeHtml(key.last_test_error)}}</div>` : '';
     const blocked = key.runtime_blocked ? `<div class="danger mini">bloqueada: ${{escapeHtml(key.runtime_blocked_reason || '')}}</div>` : '';
+    const usageByModel = (key.model_usage || []).slice(0, 4).map(item =>
+      `<div><code>${{escapeHtml(item.model)}}</code><br><span class="muted mini">x${{Number(item.weight || 1).toLocaleString('pt-BR')}} · ${{fmtNumber(item.raw_tokens || 0)}} reais -> ${{fmtNumber(item.effective_tokens || 0)}} efetivos</span></div>`
+    ).join('') || '<span class="muted mini">sem uso registrado por modelo</span>';
     return `<tr>
       <td><strong>${{escapeHtml(key.name)}}</strong><br><span class="muted mini">${{escapeHtml(key.masked || '')}}</span></td>
       <td><span class="pill">${{key.enabled ? 'ativa' : 'desativada'}}</span> <span class="pill">${{escapeHtml(key.quota_status || 'unknown')}}</span>${{blocked}}<br><span class="muted mini">${{escapeHtml(key.last_status || '')}}</span></td>
-      <td><span class="${{remainingClass}}">${{fmtNumber(key.remaining_tokens)}} restantes</span><br><span class="muted mini">${{key.remaining_percent ?? '??'}}% sobrando; ${{fmtNumber(key.used_tokens || 0)}} usados / ${{key.quota_limit_tokens ? fmtNumber(key.quota_limit_tokens) : 'limite desconhecido'}}</span></td>
+      <td><span class="${{remainingClass}}">${{fmtNumber(key.remaining_tokens)}} restantes</span><br><span class="muted mini">${{key.remaining_percent ?? '??'}}% sobrando; ${{fmtNumber(key.effective_used_tokens || key.used_tokens || 0)}} efetivos / ${{key.quota_limit_tokens ? fmtNumber(key.quota_limit_tokens) : 'limite desconhecido'}}<br>${{fmtNumber(key.used_tokens || 0)}} tokens reais</span></td>
+      <td>${{usageByModel}}</td>
       <td>${{fmtDuration(key.seconds_to_reset)}}<br><span class="muted mini">${{fmtTime(key.reset_at)}}</span></td>
       <td>${{test}}${{err}}<br><span class="muted mini">${{fmtNumber(key.last_test_model_count || 0)}} modelos listados</span></td>
     </tr>`;
@@ -682,8 +687,9 @@ def install_live_metrics(Handler, index_html, globals_dict):
 
     original_record = globals_dict.get("record_key_usage")
     if original_record and not getattr(original_record, "_live_metrics_wrapped", False):
-        def record_key_usage(name, tokens):
-            result = original_record(name, tokens)
+        def record_key_usage(name, tokens, model=None):
+            selected_model = model or str(getattr(_THREAD, "model", "") or "")
+            result = original_record(name, tokens, selected_model)
             _finish_request(name, tokens)
             return result
         record_key_usage._live_metrics_wrapped = True
@@ -719,9 +725,10 @@ def install_live_metrics(Handler, index_html, globals_dict):
                     estimated_total = _to_int(active.get("prompt_tokens_estimated")) + _to_int(active.get("output_tokens_estimated"))
                     if _to_int(active.get("output_tokens_estimated")) > 0:
                         selected_key = getattr(_THREAD, "key_name", "") or active.get("key_name")
+                        selected_model = getattr(_THREAD, "model", "") or active.get("model") or ""
                         try:
                             if original_record:
-                                original_record(selected_key, estimated_total)
+                                original_record(selected_key, estimated_total, selected_model)
                         except Exception as exc:
                             print(f"live metrics: falha registrando uso estimado: {exc}", flush=True)
                         _finish_request(selected_key, estimated_total, force_estimate=True)

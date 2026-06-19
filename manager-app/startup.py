@@ -31,6 +31,10 @@ def now():
     return int(time.time())
 
 
+def quota_used(item):
+    return max(0, int(float(item.get("effective_used_tokens", item.get("used_tokens")) or 0)))
+
+
 def read_json(path, default):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -75,7 +79,7 @@ def apply_quota_defaults():
                 item["reset_period_hours"] = RESET_HOURS
                 changed = True
 
-            used = max(0, int(float(item.get("used_tokens") or 0)))
+            used = quota_used(item)
             reset_at = int(float(item.get("reset_at") or 0))
             if reset_at <= 0:
                 base = int(float(item.get("last_used_at") or current))
@@ -85,6 +89,8 @@ def apply_quota_defaults():
 
             if reset_at <= current:
                 item["used_tokens"] = 0
+                item["effective_used_tokens"] = 0
+                item["model_usage"] = {}
                 item["last_reset_at"] = current
                 item["reset_at"] = current + RESET_SECONDS
                 item["runtime_blocked"] = False
@@ -119,7 +125,7 @@ def enabled_keys(include_depleted=False):
     for item in store.get("keys", []) if isinstance(store, dict) else []:
         if not isinstance(item, dict) or not item.get("enabled", True) or not item.get("value"):
             continue
-        used = max(0, int(float(item.get("used_tokens") or 0)))
+        used = quota_used(item)
         if not include_depleted and used >= QUOTA_LIMIT:
             continue
         result.append(item)
@@ -331,7 +337,7 @@ def recovery_loop():
         for item in store.get("keys", []) if isinstance(store, dict) else []:
             if not isinstance(item, dict) or not item.get("enabled", True) or not item.get("value"):
                 continue
-            used = max(0, int(float(item.get("used_tokens") or 0)))
+            used = quota_used(item)
             if item.get("runtime_blocked") or used >= QUOTA_LIMIT:
                 candidates.append(dict(item))
 
@@ -348,6 +354,8 @@ def recovery_loop():
                     if item.get("name") != name:
                         continue
                     item["used_tokens"] = 0
+                    item["effective_used_tokens"] = 0
+                    item["model_usage"] = {}
                     item["last_reset_at"] = now()
                     item["reset_at"] = now() + RESET_SECONDS
                     item["runtime_blocked"] = False

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -38,6 +39,62 @@ HANDOFF_DIR = env("HANDOFF_DIR", "/data/handoffs")
 EVENT_LOG_FILE = env("EVENT_LOG_FILE", "/data/events.jsonl")
 FREE_MODELS_FILE = env("FREE_MODELS_FILE", "/data/free-models.json")
 MAX_HANDOFF_CHARS = int(env("MAX_HANDOFF_CHARS", "12000") or "12000")
+
+
+def model_usage_weight(model):
+    model = normalize_direct_model_name(model).lower()
+    overrides = env("MODEL_USAGE_WEIGHTS", "").strip()
+    if overrides:
+        try:
+            loaded = json.loads(overrides)
+            if isinstance(loaded, dict):
+                for pattern, weight in loaded.items():
+                    pattern = normalize_direct_model_name(pattern).lower()
+                    if pattern and (pattern == model or pattern in model):
+                        return max(0.1, to_float(weight, 1.0))
+        except json.JSONDecodeError:
+            pass
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(b|t)\b", model)
+    if match:
+        size = float(match.group(1)) * (1000 if match.group(2) == "t" else 1)
+        if size >= 600:
+            return 7.0
+        if size >= 400:
+            return 5.0
+        if size >= 120:
+            return 2.4
+        if size >= 70:
+            return 1.8
+        if size >= 30:
+            return 1.15
+        if size >= 20:
+            return 1.0
+        if size >= 12:
+            return 0.85
+        if size <= 8:
+            return 0.65
+    lowered = model.lower()
+    if "nano" in lowered or "small" in lowered:
+        return 0.75
+    if "coder:480" in lowered:
+        return 5.0
+    return 1.0
+
+
+def weighted_tokens(tokens, model):
+    return int(round(to_int(tokens, 0) * model_usage_weight(model)))
+
+
+def model_from_body(body):
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body))
+    except Exception:
+        return ""
+    if isinstance(payload, dict):
+        return normalize_direct_model_name(payload.get("model") or "")
+    return ""
 
 
 def parse_env_api_keys():
@@ -142,12 +199,35 @@ def normalize_key_item(item, existing=None):
         used_tokens = to_int(item.get("used_tokens"), 0)
     else:
         used_tokens = 0 if changed_value else to_int(existing.get("used_tokens", 0))
+    model_usage = item.get("model_usage", existing.get("model_usage", {}))
+    if not isinstance(model_usage, dict) or changed_value:
+        model_usage = {}
+    manual_used_changed = (
+        item.get("used_tokens") is not None
+        and existing
+        and used_tokens != to_int(existing.get("used_tokens"), 0)
+        and item.get("effective_used_tokens") is None
+    )
+    if manual_used_changed:
+        model_usage = {}
+    effective_used_tokens = to_int(
+        item.get("effective_used_tokens", existing.get("effective_used_tokens", 0)),
+        0,
+    )
+    if manual_used_changed:
+        effective_used_tokens = used_tokens
+    if not effective_used_tokens:
+        effective_used_tokens = sum(to_int(value.get("effective_tokens"), 0) for value in model_usage.values() if isinstance(value, dict))
+    if not effective_used_tokens:
+        effective_used_tokens = used_tokens
     return {
         "name": name,
         "value": value,
         "enabled": bool(item.get("enabled", existing.get("enabled", True))),
         "quota_limit_tokens": quota_limit_tokens,
         "used_tokens": used_tokens,
+        "effective_used_tokens": effective_used_tokens,
+        "model_usage": model_usage,
         "reset_period_hours": reset_period_hours,
         "reset_at": reset_at,
         "last_reset_at": normalize_reset_at(item.get("last_reset_at", existing.get("last_reset_at"))),
@@ -207,6 +287,8 @@ def apply_due_resets(store):
         reset_at = normalize_reset_at(item.get("reset_at"))
         if reset_at and reset_at <= current:
             item["used_tokens"] = 0
+            item["effective_used_tokens"] = 0
+            item["model_usage"] = {}
             item["runtime_blocked"] = False
             item["runtime_blocked_reason"] = ""
             item["runtime_blocked_at"] = None
@@ -218,7 +300,7 @@ def apply_due_resets(store):
     if changed and (store.get("wait_mode") or {}).get("enabled"):
         for key in store.get("keys", []):
             limit = to_int(key.get("quota_limit_tokens"), DEFAULT_QUOTA_LIMIT_TOKENS)
-            used = to_int(key.get("used_tokens"), 0)
+            used = to_int(key.get("effective_used_tokens", key.get("used_tokens")), 0)
             if key.get("enabled", True) and not key.get("runtime_blocked") and (limit <= 0 or used < limit):
                 store["wait_mode"] = {"enabled": False, "cleared_at": current, "reason": "quota_reset_5h"}
                 break
@@ -229,7 +311,7 @@ def remaining_tokens(item):
     limit = to_int(item.get("quota_limit_tokens"), 0)
     if limit <= 0:
         return None
-    return max(0, limit - to_int(item.get("used_tokens"), 0))
+    return max(0, limit - to_int(item.get("effective_used_tokens", item.get("used_tokens")), 0))
 
 
 def remaining_percent(item):
@@ -315,6 +397,19 @@ def public_key_item(item, threshold_percent=None):
     remaining = remaining_tokens(item)
     reset_seconds = seconds_to_reset(item)
     percent = remaining_percent(item)
+    model_usage = item.get("model_usage") if isinstance(item.get("model_usage"), dict) else {}
+    model_usage_public = []
+    for model, value in model_usage.items():
+        if not isinstance(value, dict):
+            continue
+        model_usage_public.append({
+            "model": model,
+            "raw_tokens": to_int(value.get("raw_tokens"), 0),
+            "effective_tokens": to_int(value.get("effective_tokens"), 0),
+            "weight": to_float(value.get("weight"), model_usage_weight(model)),
+            "last_used_at": normalize_reset_at(value.get("last_used_at")),
+        })
+    model_usage_public.sort(key=lambda row: row["effective_tokens"], reverse=True)
     return {
         "name": item.get("name"),
         "enabled": bool(item.get("enabled", True)),
@@ -322,6 +417,7 @@ def public_key_item(item, threshold_percent=None):
         "fingerprint": key_fingerprint(item.get("value")),
         "quota_limit_tokens": to_int(item.get("quota_limit_tokens"), 0),
         "used_tokens": to_int(item.get("used_tokens"), 0),
+        "effective_used_tokens": to_int(item.get("effective_used_tokens", item.get("used_tokens")), 0),
         "remaining_tokens": remaining,
         "remaining_percent": percent,
         "quota_status": quota_status(item, threshold_percent),
@@ -336,6 +432,7 @@ def public_key_item(item, threshold_percent=None):
         "last_test_error": item.get("last_test_error") or "",
         "last_test_model_count": to_int(item.get("last_test_model_count"), 0),
         "last_status": item.get("last_status") or "",
+        "model_usage": model_usage_public,
         "runtime_blocked": bool(item.get("runtime_blocked", False)),
         "runtime_blocked_reason": item.get("runtime_blocked_reason") or "",
         "runtime_blocked_at": normalize_reset_at(item.get("runtime_blocked_at")),
@@ -357,7 +454,8 @@ def public_key_store():
         "keys": keys,
         "totals": {
             "total_known_quota_tokens": sum(item["quota_limit_tokens"] for item in known_quota),
-            "total_used_tokens": sum(item["used_tokens"] for item in keys),
+            "total_used_tokens": sum(item["effective_used_tokens"] for item in keys),
+            "total_raw_tokens": sum(item["used_tokens"] for item in keys),
             "total_remaining_tokens": sum(item["remaining_tokens"] for item in known_quota),
             "known_quota_accounts": len(known_quota),
             "unknown_quota_accounts": len(keys) - len(known_quota),
@@ -455,16 +553,38 @@ def extract_usage_tokens(raw_body, content_type=""):
         return 0
 
 
-def record_key_usage(name, tokens):
+def record_key_usage(name, tokens, model=None):
     tokens = to_int(tokens, 0)
     if not name or tokens <= 0:
         return public_key_store()
+    model = normalize_direct_model_name(model or "") or "desconhecido"
+    weight = model_usage_weight(model)
+    effective = max(1, weighted_tokens(tokens, model))
+    current = now_ts()
     store = load_key_store()
     for item in store.get("keys", []):
         if item.get("name") == name:
-            item["used_tokens"] = to_int(item.get("used_tokens"), 0) + tokens
-            item["last_used_at"] = now_ts()
-            item["last_status"] = f"used {tokens} tokens"
+            previous_raw = to_int(item.get("used_tokens"), 0)
+            previous_effective = to_int(item.get("effective_used_tokens", previous_raw), 0)
+            item["used_tokens"] = previous_raw + tokens
+            item["effective_used_tokens"] = previous_effective + effective
+            usage = item.get("model_usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            row = usage.setdefault(model, {
+                "raw_tokens": 0,
+                "effective_tokens": 0,
+                "weight": weight,
+                "requests": 0,
+            })
+            row["raw_tokens"] = to_int(row.get("raw_tokens"), 0) + tokens
+            row["effective_tokens"] = to_int(row.get("effective_tokens"), 0) + effective
+            row["weight"] = weight
+            row["requests"] = to_int(row.get("requests"), 0) + 1
+            row["last_used_at"] = current
+            item["model_usage"] = usage
+            item["last_used_at"] = current
+            item["last_status"] = f"used {tokens} tokens on {model} (x{weight:g} = {effective})"
             save_key_store(store)
             return public_key_store()
     return public_key_store()
@@ -515,6 +635,8 @@ def reset_usage(name=None):
         if name and item.get("name") != name:
             continue
         item["used_tokens"] = 0
+        item["effective_used_tokens"] = 0
+        item["model_usage"] = {}
         item["last_reset_at"] = current
         period = to_float(item.get("reset_period_hours"), 0.0)
         if period > 0:
@@ -1097,6 +1219,10 @@ def upsert_api_key(name, value, enabled=True, quota_limit_tokens=None, reset_per
         payload["reset_period_hours"] = existing.get("reset_period_hours", DEFAULT_QUOTA_RESET_HOURS)
     if reset_at is None and existing:
         payload["reset_at"] = existing.get("reset_at")
+    if used_tokens is None and existing:
+        payload["used_tokens"] = existing.get("used_tokens", 0)
+        payload["effective_used_tokens"] = existing.get("effective_used_tokens", payload["used_tokens"])
+        payload["model_usage"] = existing.get("model_usage", {})
     keys.append(normalize_key_item(payload, existing))
     store["keys"] = keys
     if not store.get("active_key"):
@@ -1187,49 +1313,66 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ollama Agent Manager</title>
   <style>
-    body { margin: 0; font-family: Arial, sans-serif; background: #0f172a; color: #e5e7eb; }
-    header { padding: 22px 28px; background: #111827; border-bottom: 1px solid #334155; }
-    main { padding: 24px; display: grid; gap: 18px; max-width: 1180px; margin: 0 auto; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-    .card { background: #111827; border: 1px solid #334155; border-radius: 14px; padding: 16px; }
-    h1, h2 { margin: 0 0 10px; }
-    .muted { color: #94a3b8; }
-    .ok { color: #86efac; }
-    .bad { color: #fca5a5; }
-    button, select, input { background: #1f2937; color: #e5e7eb; border: 1px solid #475569; border-radius: 10px; padding: 10px; }
-    button { cursor: pointer; }
-    button:hover { background: #334155; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 9px; border-bottom: 1px solid #334155; vertical-align: top; }
-    code, pre { background: #020617; border-radius: 8px; padding: 2px 6px; }
-    pre { padding: 12px; overflow: auto; white-space: pre-wrap; }
-    a { color: #93c5fd; }
-    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .statgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin: 12px 0; }
-    .stat { background: #020617; border: 1px solid #334155; border-radius: 12px; padding: 12px; }
-    .stat strong { display: block; font-size: 22px; margin-top: 4px; }
-    .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #1f2937; border: 1px solid #475569; }
-    .warn { color: #fde68a; }
-    .danger { color: #fca5a5; }
-    .mini { font-size: 12px; }
+    :root { color-scheme: dark; --bg:#101418; --panel:#171d23; --panel2:#1f272e; --line:#34414c; --text:#eef2f4; --muted:#9aa9b5; --accent:#4fb3a5; --accent2:#d6a84f; --bad:#ef8f8f; --ok:#7ad79a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 18px 24px; background: #151b20; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+    main { padding: 20px; display: grid; gap: 16px; max-width: 1360px; margin: 0 auto; }
+    h1, h2, h3 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 18px; margin-bottom: 12px; }
+    h3 { font-size: 15px; margin-bottom: 10px; }
+    .muted { color: var(--muted); }
+    .ok { color: var(--ok); }
+    .bad, .danger { color: var(--bad); }
+    .warn { color: #f2cf75; }
+    .mini { font-size: 12px; line-height: 1.45; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .actions, .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .card > .row { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; align-items: end; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+    .two-col { display: grid; grid-template-columns: minmax(320px, .8fr) minmax(420px, 1.2fr); gap: 14px; align-items: start; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
+    .subpanel { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    button, select, input { background: #11171c; color: var(--text); border: 1px solid #46545f; border-radius: 7px; padding: 9px 10px; min-height: 38px; max-width: 100%; }
+    button { cursor: pointer; font-weight: 650; }
+    button:hover { border-color: var(--accent); background: #172126; }
+    button.primary { background: var(--accent); color: #06110f; border-color: var(--accent); }
+    button.warning { border-color: var(--accent2); color: #f6dfaa; }
+    label { display: inline-grid; gap: 5px; color: var(--muted); font-size: 13px; }
+    label.inline { display: inline-flex; gap: 7px; align-items: center; }
+    input[type="checkbox"] { min-height: 0; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; font-weight: 700; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+    code, pre { background: #0b0f13; border-radius: 7px; padding: 2px 6px; }
+    pre { padding: 12px; overflow: auto; white-space: pre-wrap; max-height: 340px; }
+    a { color: #86c7ff; }
+    .statgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 10px; margin: 12px 0; }
+    .stat { background: #0d1216; border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+    .stat strong { display: block; font-size: 22px; margin-top: 4px; overflow-wrap: anywhere; }
+    .pill { display: inline-block; border-radius: 999px; padding: 3px 8px; background: #25313a; border: 1px solid #4c5b66; }
+    .formgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; align-items: end; }
+    .span2 { grid-column: span 2; }
+    @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } .span2 { grid-column: auto; } header { position: static; } }
   </style>
 </head>
 <body>
   <header>
-    <h1>Ollama Agent Manager</h1>
-    <div class="muted">Gerenciador local: Ollama Windows externo, gateway interno e OpenHands.</div>
+    <div class="toolbar">
+      <div>
+        <h1>Ollama Cloud Key Router</h1>
+        <div class="muted">Roteamento de contas, cotas ponderadas, modelos Cloud e OpenHands.</div>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="loadStatus()">Atualizar</button>
+        <button onclick="testStream()">Testar streaming</button>
+        <a href="https://ollama.com/signin" target="_blank">Login Ollama</a>
+      </div>
+    </div>
   </header>
   <main>
-    <section class="card">
-      <div class="row">
-        <button onclick="loadStatus()">Atualizar status</button>
-        <button onclick="testStream()">Testar streaming</button>
-        <button onclick="applyOpenHands()">Aplicar no OpenHands</button>
-        <button onclick="applyLocalOpenHands()">Aplicar modelo local/externo</button>
-        <a href="https://ollama.com/signin" target="_blank">Abrir login oficial Ollama no Chrome</a>
-      </div>
-    </section>
-
     <section class="grid">
       <div class="card"><h2>Ollama</h2><pre id="ollama">Carregando...</pre></div>
       <div class="card"><h2>OpenHands</h2><pre id="openhands">Carregando...</pre></div>
@@ -1240,8 +1383,9 @@ INDEX_HTML = r"""<!doctype html>
       <h2>Modelo ativo</h2>
       <div class="row">
         <select id="model"></select>
-        <label><input type="checkbox" id="stream"> streaming no OpenHands</label>
-        <span class="muted">Modelos Cloud dependem da conta autenticada no Ollama oficial.</span>
+        <label class="inline"><input type="checkbox" id="stream"> streaming no OpenHands</label>
+        <button class="primary" onclick="applyOpenHands()">Aplicar no OpenHands</button>
+        <button class="warning" onclick="applyLocalOpenHands()">Aplicar modelo local/externo</button>
       </div>
     </section>
 
@@ -1250,7 +1394,8 @@ INDEX_HTML = r"""<!doctype html>
       <p class="muted">O saldo exibido é uma estimativa local: configure o limite/reset de cada key e o gateway desconta os tokens retornados pelas respostas. A Ollama não expõe oficialmente saldo total/reset por API.</p>
       <div class="statgrid">
         <div class="stat"><span class="muted">Tokens restantes conhecidos</span><strong id="totalRemaining">-</strong></div>
-        <div class="stat"><span class="muted">Tokens usados rastreados</span><strong id="totalUsed">-</strong></div>
+        <div class="stat"><span class="muted">Uso efetivo rastreado</span><strong id="totalUsed">-</strong></div>
+        <div class="stat"><span class="muted">Tokens reais observados</span><strong id="totalRaw">-</strong></div>
         <div class="stat"><span class="muted">Contas com quota</span><strong id="knownAccounts">-</strong></div>
         <div class="stat"><span class="muted">Contas sem quota</span><strong id="unknownAccounts">-</strong></div>
         <div class="stat"><span class="muted">Estado do roteador</span><strong id="waitMode">-</strong></div>
@@ -1286,20 +1431,24 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="saveApiKey()">Salvar e testar chave</button>
         <button onclick="deleteSelectedKey()">Excluir chave ativa</button>
       </div>
-      <table>
-        <thead><tr><th>Conta/key</th><th>Status</th><th>Uso</th><th>Reset</th><th>Último teste</th></tr></thead>
-        <tbody id="keyRows"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Conta/key</th><th>Status</th><th>Uso ponderado</th><th>Modelos usados</th><th>Reset</th><th>Último teste</th></tr></thead>
+          <tbody id="keyRows"></tbody>
+        </table>
+      </div>
       <pre id="keys">Carregando...</pre>
       <p class="muted">Use apenas chaves de contas suas ou autorizadas. Elas ficam no arquivo persistente do manager e aparecem mascaradas na interface.</p>
     </section>
 
     <section class="card">
       <h2>Modelos</h2>
-      <table>
-        <thead><tr><th>Nome</th><th>Tipo</th><th>Remoto</th><th>Contexto</th><th>Capacidades</th></tr></thead>
-        <tbody id="models"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Nome</th><th>Tipo</th><th>Remoto</th><th>Contexto</th><th>Capacidades</th></tr></thead>
+          <tbody id="models"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
@@ -1391,6 +1540,8 @@ function renderKeys(store) {
   const totals = store.totals || {};
   document.getElementById('totalRemaining').textContent = fmtNumber(totals.total_remaining_tokens);
   document.getElementById('totalUsed').textContent = fmtNumber(totals.total_used_tokens || 0);
+  const rawEl = document.getElementById('totalRaw');
+  if (rawEl) rawEl.textContent = fmtNumber(totals.total_raw_tokens || 0);
   document.getElementById('knownAccounts').textContent = fmtNumber(totals.known_quota_accounts || 0);
   document.getElementById('unknownAccounts').textContent = fmtNumber(totals.unknown_quota_accounts || 0);
   const wait = store.wait_mode || {};
@@ -1410,10 +1561,14 @@ function renderKeys(store) {
     const test = key.last_test_at ? `${key.last_test_ok ? 'OK' : 'falhou'} em ${fmtTime(key.last_test_at)}` : 'não testada';
     const err = key.last_test_error ? `<div class="danger mini">${escapeHtml(key.last_test_error)}</div>` : '';
     const blocked = key.runtime_blocked ? `<div class="danger mini">bloqueada: ${escapeHtml(key.runtime_blocked_reason || '')}</div>` : '';
+    const usageByModel = (key.model_usage || []).slice(0, 4).map(item =>
+      `<div><code>${escapeHtml(item.model)}</code><br><span class="muted mini">x${Number(item.weight || 1).toLocaleString('pt-BR')} · ${fmtNumber(item.raw_tokens || 0)} reais -> ${fmtNumber(item.effective_tokens || 0)} efetivos</span></div>`
+    ).join('') || '<span class="muted mini">sem uso registrado por modelo</span>';
     return `<tr>
       <td><strong>${escapeHtml(key.name)}</strong><br><span class="muted mini">${escapeHtml(key.masked || '')}</span></td>
       <td><span class="pill">${key.enabled ? 'ativa' : 'desativada'}</span> <span class="pill">${escapeHtml(key.quota_status || 'unknown')}</span>${blocked}<br><span class="muted mini">${escapeHtml(key.last_status || '')}</span></td>
-      <td><span class="${remainingClass}">${fmtNumber(key.remaining_tokens)} restantes</span><br><span class="muted mini">${key.remaining_percent ?? '??'}% sobrando; ${fmtNumber(key.used_tokens || 0)} usados / ${key.quota_limit_tokens ? fmtNumber(key.quota_limit_tokens) : 'limite desconhecido'}</span></td>
+      <td><span class="${remainingClass}">${fmtNumber(key.remaining_tokens)} restantes</span><br><span class="muted mini">${key.remaining_percent ?? '??'}% sobrando; ${fmtNumber(key.effective_used_tokens || key.used_tokens || 0)} efetivos / ${key.quota_limit_tokens ? fmtNumber(key.quota_limit_tokens) : 'limite desconhecido'}<br>${fmtNumber(key.used_tokens || 0)} tokens reais</span></td>
+      <td>${usageByModel}</td>
       <td>${fmtDuration(key.seconds_to_reset)}<br><span class="muted mini">${fmtTime(key.reset_at)}</span></td>
       <td>${test}${err}<br><span class="muted mini">${fmtNumber(key.last_test_model_count || 0)} modelos listados</span></td>
     </tr>`;
@@ -1734,6 +1889,7 @@ class Handler(BaseHTTPRequestHandler):
                 headers[key] = self.headers.get(key)
         if mode == "direct_cloud":
             body = prepare_direct_cloud_body(body, headers.get("Content-Type", ""))
+        request_model = model_from_body(body)
         last_error = None
         errors = []
         retryable_statuses = {401, 403, 404, 408, 409, 425, 429, 500, 502, 503, 504}
@@ -1781,7 +1937,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.end_headers()
                         self.wfile.write(response_body)
                     if mode == "direct_cloud" and tokens:
-                        record_key_usage(api_key.get("name"), tokens)
+                        record_key_usage(api_key.get("name"), tokens, request_model)
                         maybe_switch_after_usage(api_key.get("name"), request_body=body, response_body=response_body if "text/event-stream" not in content_type else bytes(sample), tokens=tokens)
                     return
             except urllib.error.HTTPError as exc:

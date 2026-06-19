@@ -150,6 +150,33 @@ request activity and estimated tokens per second using data stored in:
 
 The refresh interval defaults to `LIVE_METRICS_REFRESH_SECONDS=2`.
 
+## Dynamic Model-Weighted Quotas
+
+The manager keeps two quota counters per key:
+
+- `used_tokens`: raw tokens observed in Ollama/OpenAI-compatible usage fields;
+- `effective_used_tokens`: quota units after applying the current model weight.
+
+Every completed request is also added to a per-key `model_usage` ledger with the
+model name, raw tokens, effective tokens, request count, and weight used. The UI
+shows this breakdown so switching from a lighter model to a heavier model
+changes future deductions without losing the old per-model history.
+
+Because Ollama Cloud does not expose an official account-balance API, weights are
+a local approximation of relative Cloud cost. Defaults are based on model size:
+small models discount below `1x`, roughly 20B models use `1x`, 120B/123B models
+use a higher multiplier, and very large 480B+ models use larger multipliers.
+
+Override any default with `MODEL_USAGE_WEIGHTS`:
+
+```bash
+MODEL_USAGE_WEIGHTS={"gpt-oss:20b":1,"gpt-oss:120b":2.4,"qwen3-coder:480b":5}
+```
+
+Manual resets clear both raw and effective counters. If you manually edit
+`tokens usados agora` for a key, that value becomes the new effective baseline
+and the per-model breakdown for that key starts fresh.
+
 ## Profiles
 
 ### `external-ollama`
