@@ -148,7 +148,7 @@ services:
       RAG_WEB_SEARCH_ENGINE: ${RAG_WEB_SEARCH_ENGINE:-searxng}
       SEARXNG_QUERY_URL: http://searxng:8080/search?q=<query>
     volumes:
-      - open-webui-data:/app/backend/data
+      - ${OPEN_WEBUI_DATA_DIR:-open-webui-data}:/app/backend/data
     networks:
       - openhands
 
