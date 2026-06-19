@@ -31,10 +31,12 @@ MANAGER_PASSWORD = env("MANAGER_PASSWORD", "change-me")
 PROXY_API_KEY = env("PROXY_API_KEY", LLM_API_KEY)
 REQUEST_TIMEOUT = float(env("REQUEST_TIMEOUT", "30"))
 API_KEYS_FILE = env("API_KEYS_FILE", "/data/api-keys.json")
-DEFAULT_QUOTA_RESET_HOURS = float(env("DEFAULT_QUOTA_RESET_HOURS", "0") or "0")
+DEFAULT_QUOTA_RESET_HOURS = float(env("DEFAULT_QUOTA_RESET_HOURS", "3.1666666667") or "5")
+DEFAULT_QUOTA_LIMIT_TOKENS = int(float(env("DEFAULT_QUOTA_LIMIT_TOKENS", "60000") or "60000"))
 SWITCH_THRESHOLD_PERCENT = float(env("SWITCH_THRESHOLD_PERCENT", "10") or "10")
 HANDOFF_DIR = env("HANDOFF_DIR", "/data/handoffs")
 EVENT_LOG_FILE = env("EVENT_LOG_FILE", "/data/events.jsonl")
+FREE_MODELS_FILE = env("FREE_MODELS_FILE", "/data/free-models.json")
 MAX_HANDOFF_CHARS = int(env("MAX_HANDOFF_CHARS", "12000") or "12000")
 
 
@@ -133,7 +135,7 @@ def normalize_key_item(item, existing=None):
         DEFAULT_QUOTA_RESET_HOURS,
     )
     reset_at = normalize_reset_at(item.get("reset_at", existing.get("reset_at")))
-    quota_limit_tokens = to_int(item.get("quota_limit_tokens", existing.get("quota_limit_tokens", 0)))
+    quota_limit_tokens = to_int(item.get("quota_limit_tokens", existing.get("quota_limit_tokens", DEFAULT_QUOTA_LIMIT_TOKENS)), DEFAULT_QUOTA_LIMIT_TOKENS)
     if not reset_at and quota_limit_tokens > 0 and reset_period_hours > 0:
         reset_at = now_ts() + int(reset_period_hours * 3600)
     if item.get("used_tokens") is not None:
@@ -205,11 +207,21 @@ def apply_due_resets(store):
         reset_at = normalize_reset_at(item.get("reset_at"))
         if reset_at and reset_at <= current:
             item["used_tokens"] = 0
+            item["runtime_blocked"] = False
+            item["runtime_blocked_reason"] = ""
+            item["runtime_blocked_at"] = None
             item["last_reset_at"] = current
             period = to_float(item.get("reset_period_hours"), 0.0)
             item["reset_at"] = current + int(period * 3600) if period > 0 else None
             item["last_status"] = "usage reset"
             changed = True
+    if changed and (store.get("wait_mode") or {}).get("enabled"):
+        for key in store.get("keys", []):
+            limit = to_int(key.get("quota_limit_tokens"), DEFAULT_QUOTA_LIMIT_TOKENS)
+            used = to_int(key.get("used_tokens"), 0)
+            if key.get("enabled", True) and not key.get("runtime_blocked") and (limit <= 0 or used < limit):
+                store["wait_mode"] = {"enabled": False, "cleared_at": current, "reason": "quota_reset_5h"}
+                break
     return changed
 
 
@@ -391,7 +403,12 @@ def ordered_keys_by_quota(keys, active_key=None, threshold_percent=None):
 
 def active_api_keys():
     store = load_key_store()
-    keys = [k for k in store.get("keys", []) if k.get("enabled", True) and not k.get("runtime_blocked")]
+    keys = [
+        k for k in store.get("keys", [])
+        if k.get("enabled", True)
+        and not k.get("runtime_blocked")
+        and (remaining_tokens(k) is None or remaining_tokens(k) > 0)
+    ]
     active = store.get("active_key")
     threshold = store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT)
     if store.get("auto_fallback", False):
@@ -801,9 +818,54 @@ def classify_model(model):
     }
 
 
+# BEGIN OMEGA_DYNAMIC_MODELS
+def configured_free_models():
+    models = []
+    try:
+        data = json.loads(Path(FREE_MODELS_FILE).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            models = data.get("models", [])
+        elif isinstance(data, list):
+            models = data
+    except Exception:
+        pass
+    if not models:
+        models = [item.strip() for item in env("FREE_MODELS", "").split(",") if item.strip()]
+    out = []
+    seen = set()
+    for model in models:
+        name = str(model or "").strip()
+        key = normalize_direct_model_name(name)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def filter_model_payload(raw_body):
+    try:
+        obj = json.loads(raw_body.decode("utf-8", "replace") if isinstance(raw_body, (bytes, bytearray)) else str(raw_body))
+    except Exception:
+        return raw_body
+    allowed = {normalize_direct_model_name(name) for name in configured_free_models()}
+    data = obj.get("data") if isinstance(obj, dict) else None
+    if isinstance(data, list):
+        obj["data"] = [
+            item for item in data
+            if isinstance(item, dict) and normalize_direct_model_name(item.get("id")) in allowed
+        ]
+    encoded = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    return encoded if isinstance(raw_body, (bytes, bytearray)) else encoded.decode("utf-8")
+
+
 def list_direct_cloud_models():
     keys = active_api_keys()
     if not keys:
+        keys = [k for k in load_key_store().get("keys", []) if k.get("enabled", True) and k.get("value")]
+    if not keys:
+        return []
+    allowed = {normalize_direct_model_name(name) for name in configured_free_models()}
+    if not allowed:
         return []
     data = http_json(
         "GET",
@@ -814,18 +876,18 @@ def list_direct_cloud_models():
     models = []
     for item in (data or {}).get("data", []):
         model_id = item.get("id")
-        if not model_id:
+        if not model_id or normalize_direct_model_name(model_id) not in allowed:
             continue
         models.append({
             "name": model_id,
             "remote_model": model_id,
             "remote_host": DIRECT_CLOUD_BASE_URL,
             "context_length": None,
-            "capabilities": ["cloud"],
+            "capabilities": ["cloud", "free-tested"],
             "kind": "cloud",
         })
     return models
-
+# END OMEGA_DYNAMIC_MODELS
 
 def collect_status():
     key_store = public_key_store()
@@ -1705,6 +1767,8 @@ class Handler(BaseHTTPRequestHandler):
                         tokens = extract_usage_tokens(bytes(sample), content_type)
                     else:
                         response_body = resp.read()
+                        if mode == "direct_cloud" and suffix == "/v1/models":
+                            response_body = filter_model_payload(response_body)
                         tokens = extract_usage_tokens(response_body, content_type)
                         self.send_response(resp.status)
                         self.send_header("Content-Type", content_type)
@@ -1804,6 +1868,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self.require_basic_auth():
+            return
+        # FREE_MODELS_FILTER_V1: também filtra o endpoint OpenAI usado por clientes.
+        if self.path.startswith("/llm/v1/models") and load_key_store().get("upstream_mode") == "direct_cloud":
+            models = list_direct_cloud_models()
+            self.send_json(200, {
+                "object": "list",
+                "data": [
+                    {"id": model["name"], "object": "model", "created": 0, "owned_by": "ollama"}
+                    for model in models
+                ],
+            })
             return
         if self.path.startswith("/llm/"):
             self.proxy("/llm")
@@ -1906,6 +1981,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(exc.code, {"error": body})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
+
+
+# BEGIN MANAGER_FEATURE_EXTENSION
+try:
+    from feature_extension import install_features
+    Handler, INDEX_HTML = install_features(Handler, INDEX_HTML, globals())
+except Exception as feature_extension_error:
+    print(
+        f"Falha carregando recursos extras: {feature_extension_error}",
+        flush=True,
+    )
+# END MANAGER_FEATURE_EXTENSION
+
+
+# BEGIN LIVE_METRICS_EXTENSION
+try:
+    from live_metrics_extension import install_live_metrics
+    Handler, INDEX_HTML = install_live_metrics(Handler, INDEX_HTML, globals())
+except Exception as live_metrics_error:
+    print(f"Falha carregando métricas ao vivo: {live_metrics_error}", flush=True)
+# END LIVE_METRICS_EXTENSION
 
 
 if __name__ == "__main__":

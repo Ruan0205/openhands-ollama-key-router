@@ -70,6 +70,86 @@ Set:
 
 The manager calls `https://ollama.com/v1` directly and presents an OpenAI-compatible gateway to OpenHands at `/llm/v1`.
 
+This is now the default production path for this project: the Linux server runs
+the manager, OpenHands, Open WebUI, and search, while the manager talks to
+Ollama Cloud directly with stored API keys. A Windows Ollama installation is no
+longer required for Cloud routing.
+
+## Production Defaults
+
+The manager image starts through `manager-entrypoint.sh`, which launches:
+
+- `startup.py`: applies defaults, probes Cloud models on startup, and applies a
+  working free model to OpenHands when needed;
+- `quota_sync.py`: keeps the local quota ledger aligned with the configured
+  reset window and periodically tests blocked/depleted accounts;
+- `app.py`: serves the UI and the OpenAI-compatible `/llm/v1` gateway.
+
+Current defaults:
+
+- `UPSTREAM_MODE=direct_cloud`
+- `DEFAULT_QUOTA_LIMIT_TOKENS=60000`
+- `DEFAULT_QUOTA_RESET_HOURS=3.1666666667` (3 hours and 10 minutes)
+- `ACCOUNT_RECHECK_SECONDS=300`
+- `MODEL_PROBE_ON_START=true`
+- `QUOTA_SYNC_ENABLED=true`
+- `OPENHANDS_STREAM=false`
+
+If an account reaches the local 60000-token ledger, the manager pauses that key
+until the 3h10 window expires or until a periodic probe proves the account is
+answering again. When an account is released, wait mode is cleared and the
+router can use it again.
+
+## Free Cloud Model Discovery
+
+On startup, the manager lists `https://ollama.com/v1/models` with an active API
+key and probes each catalog model with a tiny one-token completion. Models that
+return subscription errors are treated as paid/unavailable for the current
+accounts and are not shown in the manager model selector or `/llm/v1/models`.
+
+The filtered catalog is cached in:
+
+```text
+/data/free-models.json
+```
+
+You can seed or override the list with `FREE_MODELS`, but the normal mode is to
+let the startup probe refresh it automatically whenever the manager starts.
+
+## Import, Export, And External Endpoint
+
+The manager UI includes:
+
+- `Exportar chaves TXT`: downloads the configured API keys as a text file;
+- `Importar chaves TXT`: imports one key per line or `name=key` lines;
+- external API controls: enables/disables a host/port style endpoint setting
+  for other applications to discover where they should connect.
+
+The external endpoint setting is stored in:
+
+```text
+/data/external-api.json
+```
+
+The API key store remains in:
+
+```text
+/data/api-keys.json
+```
+
+Do not commit files from `/data`; they contain private API keys and local state.
+
+## Live Metrics
+
+The UI refreshes usage without a manual page reload. It also shows recent
+request activity and estimated tokens per second using data stored in:
+
+```text
+/data/live-metrics.json
+```
+
+The refresh interval defaults to `LIVE_METRICS_REFRESH_SECONDS=2`.
+
 ## Profiles
 
 ### `external-ollama`
