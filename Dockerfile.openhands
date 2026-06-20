@@ -36,4 +36,40 @@ new_timeout = """            except asyncio.CancelledError:
 if old_timeout not in text:
     raise SystemExit("Expected health-check exception block was not found")
 path.write_text(text.replace(old_timeout, new_timeout))
+
+spec_path = Path("/app/openhands/app_server/sandbox/docker_sandbox_spec_service.py")
+spec_text = spec_path.read_text()
+spec_marker = """                'PYTHONUNBUFFERED': '1',
+                'ENV_LOG_LEVEL': '20',
+                **get_agent_server_env(),
+"""
+spec_replacement = """                'PYTHONUNBUFFERED': '1',
+                'ENV_LOG_LEVEL': '20',
+                'OPENHANDS_STREAM': 'false',
+                'LLM_STREAM': 'false',
+                **get_agent_server_env(),
+"""
+if spec_marker not in spec_text:
+    raise SystemExit("Expected sandbox spec env block was not found")
+spec_path.write_text(spec_text.replace(spec_marker, spec_replacement))
+
+llm_path = Path("/app/.venv/lib/python3.13/site-packages/openhands/sdk/llm/llm.py")
+llm_text = llm_path.read_text()
+stream_block = """        enable_streaming = bool(kwargs.get("stream", False)) or self.stream
+        if enable_streaming:
+            if on_token is None:
+                raise ValueError("Streaming requires an on_token callback")
+            kwargs["stream"] = True
+"""
+stream_replacement = """        enable_streaming = bool(kwargs.get("stream", False)) or self.stream
+        if enable_streaming:
+            if on_token is None:
+                enable_streaming = False
+                kwargs["stream"] = False
+            else:
+                kwargs["stream"] = True
+"""
+if stream_block not in llm_text:
+    raise SystemExit("Expected LLM streaming block was not found")
+llm_path.write_text(llm_text.replace(stream_block, stream_replacement))
 PY

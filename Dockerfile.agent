@@ -1,5 +1,8 @@
 FROM ghcr.io/openhands/agent-server:1.26.0-python
 
+ENV OPENHANDS_STREAM=false
+ENV LLM_STREAM=false
+
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-client \
