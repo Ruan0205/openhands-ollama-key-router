@@ -27,6 +27,7 @@ DEFAULT_MODEL = env("DEFAULT_MODEL", "nemotron-3-super:cloud")
 OPENHANDS_LLM_BASE_URL = env("OPENHANDS_LLM_BASE_URL", "http://ollama-manager:8080/llm/v1").rstrip("/")
 LLM_API_KEY = env("LLM_API_KEY", "ollama")
 OPENHANDS_STREAM = env("OPENHANDS_STREAM", "false").lower() in ("1", "true", "yes", "on")
+OPENHANDS_ALLOW_STREAM = env("OPENHANDS_ALLOW_STREAM", "false").lower() in ("1", "true", "yes", "on")
 MANAGER_USERNAME = env("MANAGER_USERNAME", "admin")
 MANAGER_PASSWORD = env("MANAGER_PASSWORD", "change-me")
 PROXY_API_KEY = env("PROXY_API_KEY", LLM_API_KEY)
@@ -1172,7 +1173,8 @@ def apply_openhands(model, base_url=None, stream=None, allow_local_model=False):
     if store.get("upstream_mode") != "direct_cloud" and not allow_local_model:
         raise ValueError("Modo local/externo só pode ser aplicado pelo botão explícito de modelo local.")
     llm_model = model if model.startswith("openai/") else f"openai/{model}"
-    use_stream = OPENHANDS_STREAM if stream is None else bool(stream)
+    requested_stream = OPENHANDS_STREAM if stream is None else bool(stream)
+    use_stream = bool(requested_stream and OPENHANDS_ALLOW_STREAM)
     payload = {
         "agent_settings_diff": {
             "llm": {
@@ -1191,6 +1193,10 @@ def apply_openhands(model, base_url=None, stream=None, allow_local_model=False):
     }
     result = http_json("POST", f"{OPENHANDS_API_URL}/api/v1/settings", payload)
     clear_wait_mode("apply_openhands")
+    if requested_stream and not use_stream:
+        result = dict(result or {})
+        result["stream_forced_off"] = True
+        result["stream_note"] = "OpenHands stream foi forçado para false para evitar erro: Streaming requires an on_token callback."
     return result
 
 
