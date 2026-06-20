@@ -71,5 +71,24 @@ stream_replacement = """        enable_streaming = bool(kwargs.get("stream", Fal
 """
 if stream_block not in llm_text:
     raise SystemExit("Expected LLM streaming block was not found")
-llm_path.write_text(llm_text.replace(stream_block, stream_replacement))
+llm_text = llm_text.replace(stream_block, stream_replacement)
+subscription_stream_block = """        user_enable_streaming = bool(kwargs.get("stream", False)) or self.stream
+        if user_enable_streaming:
+            # We allow on_token to be None for subscription mode
+            if on_token is None and not self.is_subscription:
+                raise ValueError("Streaming requires an on_token callback")
+            kwargs["stream"] = True
+"""
+subscription_stream_replacement = """        user_enable_streaming = bool(kwargs.get("stream", False)) or self.stream
+        if user_enable_streaming:
+            # We allow on_token to be None for subscription mode
+            if on_token is None and not self.is_subscription:
+                user_enable_streaming = False
+                kwargs["stream"] = False
+            else:
+                kwargs["stream"] = True
+"""
+if subscription_stream_block not in llm_text:
+    raise SystemExit("Expected subscription LLM streaming block was not found")
+llm_path.write_text(llm_text.replace(subscription_stream_block, subscription_stream_replacement))
 PY
