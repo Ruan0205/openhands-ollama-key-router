@@ -36,6 +36,7 @@ API_KEYS_FILE = env("API_KEYS_FILE", "/data/api-keys.json")
 DEFAULT_QUOTA_RESET_HOURS = float(env("DEFAULT_QUOTA_RESET_HOURS", "3.1666666667") or "5")
 DEFAULT_QUOTA_LIMIT_TOKENS = int(float(env("DEFAULT_QUOTA_LIMIT_TOKENS", "60000") or "60000"))
 SWITCH_THRESHOLD_PERCENT = float(env("SWITCH_THRESHOLD_PERCENT", "10") or "10")
+ACCOUNT_RECHECK_SECONDS = max(60, int(float(env("ACCOUNT_RECHECK_SECONDS", "300") or "300")))
 HANDOFF_DIR = env("HANDOFF_DIR", "/data/handoffs")
 EVENT_LOG_FILE = env("EVENT_LOG_FILE", "/data/events.jsonl")
 FREE_MODELS_FILE = env("FREE_MODELS_FILE", "/data/free-models.json")
@@ -273,6 +274,7 @@ def normalize_store(store):
     return {
         "upstream_mode": mode,
         "active_key": active_key,
+        "selected_model": normalize_direct_model_name(store.get("selected_model") or ""),
         "auto_fallback": bool(store.get("auto_fallback", False)),
         "switch_threshold_percent": threshold,
         "last_switch": store.get("last_switch") or {},
@@ -303,7 +305,7 @@ def apply_due_resets(store):
             limit = to_int(key.get("quota_limit_tokens"), DEFAULT_QUOTA_LIMIT_TOKENS)
             used = to_int(key.get("effective_used_tokens", key.get("used_tokens")), 0)
             if key.get("enabled", True) and not key.get("runtime_blocked") and (limit <= 0 or used < limit):
-                store["wait_mode"] = {"enabled": False, "cleared_at": current, "reason": "quota_reset_5h"}
+                store["wait_mode"] = {"enabled": False, "cleared_at": current, "reason": "quota_reset_3h10m"}
                 break
     return changed
 
@@ -313,6 +315,48 @@ def remaining_tokens(item):
     if limit <= 0:
         return None
     return max(0, limit - to_int(item.get("effective_used_tokens", item.get("used_tokens")), 0))
+
+
+def key_has_usable_quota(item):
+    remaining = remaining_tokens(item)
+    return remaining is None or remaining > 0
+
+
+def key_is_available(item):
+    return (
+        item.get("enabled", True)
+        and bool(str(item.get("value") or "").strip())
+        and not item.get("runtime_blocked")
+        and key_has_usable_quota(item)
+    )
+
+
+def repair_key_availability(store, reason="availability_recheck", force=False):
+    changed = apply_due_resets(store)
+    current = now_ts()
+    if any(key_is_available(item) for item in store.get("keys", [])):
+        if (store.get("wait_mode") or {}).get("enabled"):
+            store["wait_mode"] = {"enabled": False, "cleared_at": current, "reason": reason}
+            changed = True
+        return changed
+
+    for item in store.get("keys", []):
+        if not item.get("enabled", True) or not str(item.get("value") or "").strip():
+            continue
+        if not key_has_usable_quota(item):
+            continue
+        blocked_at = normalize_reset_at(item.get("runtime_blocked_at")) or 0
+        stale_block = not blocked_at or (current - blocked_at) >= ACCOUNT_RECHECK_SECONDS
+        if item.get("runtime_blocked") and (force or stale_block):
+            item["runtime_blocked"] = False
+            item["runtime_blocked_reason"] = ""
+            item["runtime_blocked_at"] = None
+            item["last_status"] = f"retry liberado: {reason}"
+            changed = True
+
+    if changed and any(key_is_available(item) for item in store.get("keys", [])):
+        store["wait_mode"] = {"enabled": False, "cleared_at": current, "reason": reason}
+    return changed
 
 
 def remaining_percent(item):
@@ -442,12 +486,15 @@ def public_key_item(item, threshold_percent=None):
 
 def public_key_store():
     store = load_key_store()
+    if repair_key_availability(store, "status_recheck"):
+        save_key_store(store)
     threshold = to_float(store.get("switch_threshold_percent"), SWITCH_THRESHOLD_PERCENT)
     keys = [public_key_item(item, threshold) for item in store.get("keys", [])]
     known_quota = [item for item in keys if item["remaining_tokens"] is not None]
     return {
         "upstream_mode": store.get("upstream_mode", "external_ollama"),
         "active_key": store.get("active_key"),
+        "selected_model": store.get("selected_model") or "",
         "auto_fallback": bool(store.get("auto_fallback", False)),
         "switch_threshold_percent": threshold,
         "last_switch": store.get("last_switch") or {},
@@ -502,11 +549,11 @@ def ordered_keys_by_quota(keys, active_key=None, threshold_percent=None):
 
 def active_api_keys():
     store = load_key_store()
+    if repair_key_availability(store, "active_key_recheck"):
+        save_key_store(store)
     keys = [
         k for k in store.get("keys", [])
-        if k.get("enabled", True)
-        and not k.get("runtime_blocked")
-        and (remaining_tokens(k) is None or remaining_tokens(k) > 0)
+        if key_is_available(k)
     ]
     active = store.get("active_key")
     threshold = store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT)
@@ -748,9 +795,10 @@ def key_snapshot(name, store=None):
 
 
 def next_key_name(store, previous_name=None):
+    repair_key_availability(store, "next_key_recheck")
     keys = [
         k for k in store.get("keys", [])
-        if k.get("enabled", True) and not k.get("runtime_blocked") and k.get("name") != previous_name
+        if key_is_available(k) and k.get("name") != previous_name
     ]
     ordered = ordered_keys_by_quota(keys, store.get("active_key"), store.get("switch_threshold_percent", SWITCH_THRESHOLD_PERCENT))
     return ordered[0].get("name") if ordered else None
@@ -784,6 +832,10 @@ def clear_wait_mode(reason="user_action"):
 
 def enter_wait_mode(reason, errors=None, request_body=None, previous_key=None):
     store = load_key_store()
+    if repair_key_availability(store, "wait_mode_recheck"):
+        save_key_store(store)
+        if any(key_is_available(item) for item in store.get("keys", [])):
+            return public_key_store()
     handoff_path, _ = write_handoff(
         reason,
         previous_key,
@@ -1012,6 +1064,29 @@ def list_direct_cloud_models():
     return models
 # END OMEGA_DYNAMIC_MODELS
 
+
+def ollama_tags_payload(models):
+    modified_at = datetime.fromtimestamp(now_ts(), timezone.utc).isoformat()
+    return {
+        "models": [
+            {
+                "name": model["name"],
+                "model": model["name"],
+                "modified_at": modified_at,
+                "size": 0,
+                "digest": "ollama-cloud",
+                "details": {
+                    "format": "cloud",
+                    "family": "ollama-cloud",
+                    "families": ["ollama-cloud"],
+                    "parameter_size": "",
+                    "quantization_level": "",
+                },
+            }
+            for model in models
+        ]
+    }
+
 def collect_status():
     key_store = public_key_store()
     direct_mode = key_store.get("upstream_mode") == "direct_cloud"
@@ -1076,6 +1151,7 @@ def collect_status():
         llm = settings.get("agent_settings", {}).get("llm", {})
         out["openhands_llm"] = {
             "model": llm.get("model"),
+            "normalized_model": normalize_direct_model_name(llm.get("model")),
             "base_url": llm.get("base_url"),
             "stream": llm.get("stream"),
             "reasoning_effort": llm.get("reasoning_effort"),
@@ -1172,7 +1248,8 @@ def apply_openhands(model, base_url=None, stream=None, allow_local_model=False):
     store = load_key_store()
     if store.get("upstream_mode") != "direct_cloud" and not allow_local_model:
         raise ValueError("Modo local/externo só pode ser aplicado pelo botão explícito de modelo local.")
-    llm_model = model if model.startswith("openai/") else f"openai/{model}"
+    selected_model = normalize_direct_model_name(model)
+    llm_model = model if str(model).startswith("openai/") else f"openai/{selected_model}"
     requested_stream = OPENHANDS_STREAM if stream is None else bool(stream)
     use_stream = bool(requested_stream and OPENHANDS_ALLOW_STREAM)
     payload = {
@@ -1192,6 +1269,9 @@ def apply_openhands(model, base_url=None, stream=None, allow_local_model=False):
         }
     }
     result = http_json("POST", f"{OPENHANDS_API_URL}/api/v1/settings", payload)
+    store = load_key_store()
+    store["selected_model"] = selected_model
+    save_key_store(store)
     clear_wait_mode("apply_openhands")
     if requested_stream and not use_stream:
         result = dict(result or {})
@@ -1515,12 +1595,29 @@ async function loadStatus() {
     renderKeys(data.key_store || {});
     const select = document.getElementById('model');
     select.innerHTML = '';
+    const llm = data.openhands_llm || {};
+    const currentModel = (llm.normalized_model || (llm.model || '').replace(/^openai\//, '').replace(/:cloud$/, '')).trim();
+    const defaultModel = ((data.key_store || {}).selected_model || data.default_model || '').replace(/^openai\//, '').replace(/:cloud$/, '').trim();
+    let selectedModelFound = false;
     for (const m of data.models || []) {
       const opt = document.createElement('option');
       opt.value = m.name;
       opt.textContent = `${m.name} (${m.kind})`;
-      if (m.name === data.default_model || `openai/${m.name}` === (data.openhands_llm || {}).model) opt.selected = true;
+      const normalizedName = (m.name || '').replace(/^openai\//, '').replace(/:cloud$/, '');
+      if (currentModel && normalizedName === currentModel) {
+        opt.selected = true;
+        selectedModelFound = true;
+      }
       select.appendChild(opt);
+    }
+    if (!selectedModelFound && defaultModel) {
+      for (const opt of select.options) {
+        const normalizedName = (opt.value || '').replace(/^openai\//, '').replace(/:cloud$/, '');
+        if (normalizedName === defaultModel) {
+          opt.selected = true;
+          break;
+        }
+      }
     }
     document.getElementById('stream').checked = Boolean((data.openhands_llm || {}).stream);
     document.getElementById('models').innerHTML = (data.models || []).map(m => `
@@ -1865,6 +1962,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(401, {"error": "missing or invalid bearer token"})
             return
         store = load_key_store()
+        if repair_key_availability(store, "proxy_recheck"):
+            save_key_store(store)
         mode = store.get("upstream_mode", "external_ollama")
         if mode == "direct_cloud" and (store.get("wait_mode") or {}).get("enabled"):
             self.send_json(503, {
@@ -2041,6 +2140,9 @@ class Handler(BaseHTTPRequestHandler):
                     for model in models
                 ],
             })
+            return
+        if self.path.startswith("/llm/api/tags") and load_key_store().get("upstream_mode") == "direct_cloud":
+            self.send_json(200, ollama_tags_payload(list_direct_cloud_models()))
             return
         if self.path.startswith("/llm/"):
             self.proxy("/llm")

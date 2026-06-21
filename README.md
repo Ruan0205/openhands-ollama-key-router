@@ -100,6 +100,10 @@ until the 3h10 window expires or until a periodic probe proves the account is
 answering again. When an account is released, wait mode is cleared and the
 router can use it again.
 
+The gateway also rechecks runtime-blocked keys before answering OpenHands with
+wait mode. This prevents temporary 429/503 failures from leaving the router
+stuck after usable quota is available again.
+
 ## Free Cloud Model Discovery
 
 On startup, the manager lists `https://ollama.com/v1/models` with an active API
@@ -115,6 +119,15 @@ The filtered catalog is cached in:
 
 You can seed or override the list with `FREE_MODELS`, but the normal mode is to
 let the startup probe refresh it automatically whenever the manager starts.
+
+When a model is applied to OpenHands, the manager stores it as `selected_model`
+in `/data/api-keys.json`. Startup uses that saved choice before falling back to
+the default preference list, so restarts do not silently return the UI or
+OpenHands to `gpt-oss:20b`.
+
+For Ollama-compatible clients that probe native model tags, direct Cloud mode
+serves `/llm/api/tags` from the same filtered free-model catalog. The OpenAI
+model list remains available at `/llm/v1/models`.
 
 ## Import, Export, And External Endpoint
 

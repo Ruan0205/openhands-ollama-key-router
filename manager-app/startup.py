@@ -111,7 +111,7 @@ def apply_quota_defaults():
             store["wait_mode"] = {
                 "enabled": False,
                 "cleared_at": current,
-                "reason": "quota_reset_5h",
+                "reason": "quota_reset_3h10m",
             }
             changed = True
         return changed
@@ -171,6 +171,24 @@ def cached_models():
     if isinstance(data, dict):
         return [str(x) for x in data.get("models", []) if str(x).strip()]
     return []
+
+
+def normalize_model_name(model):
+    model = str(model or "").strip()
+    if model.startswith("openai/"):
+        model = model.split("/", 1)[1]
+    if model.endswith(":cloud"):
+        model = model[:-6]
+    return model
+
+
+def selected_model_from_store(models):
+    store = read_json(DATA_FILE, {})
+    selected = normalize_model_name((store or {}).get("selected_model") if isinstance(store, dict) else "")
+    if not selected:
+        return None
+    normalized = {normalize_model_name(model): model for model in models}
+    return normalized.get(selected)
 
 
 def save_models(models, catalog_count=0):
@@ -285,7 +303,7 @@ def manager_json(method, path, payload=None, timeout=30):
 
 
 def configure_model_after_discovery(models):
-    model = preferred_model(models)
+    model = selected_model_from_store(models) or preferred_model(models)
     if not model:
         return
     for _ in range(120):
@@ -294,10 +312,8 @@ def configure_model_after_discovery(models):
         try:
             status = manager_json("GET", "/api/status")
             current = str((status.get("openhands_llm") or {}).get("model") or "")
-            if current.startswith("openai/"):
-                current = current.split("/", 1)[1]
-            current = current.removesuffix(":cloud")
-            normalized = {m.removesuffix(":cloud") for m in models}
+            current = normalize_model_name(current)
+            normalized = {normalize_model_name(m) for m in models}
             if current not in normalized:
                 manager_json("POST", "/api/apply-openhands", {
                     "model": model,
